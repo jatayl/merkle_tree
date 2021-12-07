@@ -3,12 +3,12 @@ mod join;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash;
-use std::mem::{self, MaybeUninit};
+use std::mem;
 use std::rc::Rc;
 
 use blake3::{Hash, Hasher};
 use crossbeam::channel::{self, Sender};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // maybe use slab instead. that would be cool
 
@@ -57,14 +57,16 @@ impl<M: Merklable> Branch<M> {
 pub struct Leaf<M: Merklable> {
     inner: M,
     hash: Hash,
+    index: usize, // keep index here. not sure if this is ideal
     parent: Rc<RefCell<Branch<M>>>,
 }
 
 impl<M: Merklable> Leaf<M> {
-    fn new(inner: M, hash: Hash, parent: Rc<RefCell<Branch<M>>>) -> Self {
+    fn new(inner: M, hash: Hash, index: usize, parent: Rc<RefCell<Branch<M>>>) -> Self {
         Leaf {
             inner,
             hash,
+            index,
             parent,
         }
     }
@@ -79,10 +81,20 @@ enum Child<M: Merklable> {
     Leaf(Rc<RefCell<Leaf<M>>>),
 }
 
-pub struct Proof<M: Merklable> {
-    data: M,
-    blocks: Vec<(M::Branch, Hash)>,
-    digest: Hash,
+impl<M: Merklable> Child<M> {
+    fn inner(&self) -> M::Branch {
+        match self {
+            Child::Branch(b) => b.borrow().inner,
+            Child::Leaf(l) => l.borrow().inner.to_branch(),
+        }
+    }
+
+    fn hash(&self) -> Hash {
+        match self {
+            Child::Branch(b) => b.borrow().hash,
+            Child::Leaf(l) => l.borrow().hash,
+        }
+    }
 }
 
 pub struct MerkleTree<M: Merklable> {
@@ -124,12 +136,17 @@ impl<M: Merklable> MerkleTree<M> {
         }
     }
 
+    pub fn root(&self) -> Option<M::Branch> {
+        self.root.as_ref().map(|root| root.borrow().inner)
+    }
+
     // will need to make multiple updates good
     // for now assume this will be called only once
     pub fn update(&mut self, arr: impl AsRef<[M]>) {
         let arr = arr.as_ref();
+        let arr: Vec<_> = (0..arr.len()).map(|i| (arr[i], i)).collect();
         let (leaves_s, leaves_r) = channel::bounded(arr.len());
-        let root = Self::generate_subtree::<join::SerialJoin>(arr, leaves_s);
+        let root = Self::generate_subtree::<join::SerialJoin>(&arr, leaves_s);
         self.root = Some(root.into_inner());
         self.leaves = leaves_r
             .iter()
@@ -158,12 +175,15 @@ impl<M: Merklable> MerkleTree<M> {
     }
 
     fn generate_subtree<J: join::Join>(
-        arr: &[M],
+        arr: &[(M, usize)],
         leaves_s: Sender<Ratn<Leaf<M>>>,
     ) -> Ratn<Branch<M>> {
         if arr.len() == 2 {
-            let inner_l = arr[0];
-            let inner_r = arr[1];
+            let index_l = arr[0].1;
+            let index_r = arr[1].1;
+
+            let inner_l = arr[0].0;
+            let inner_r = arr[1].0;
             let inner_b = M::Branch::fold(&inner_l.to_branch(), &inner_r.to_branch());
 
             let hash_l = blake3::hash(&bincode::serialize(&inner_l).unwrap());
@@ -180,8 +200,18 @@ impl<M: Merklable> MerkleTree<M> {
             // Safety: we set the correct parent right after
             let null = unsafe { Rc::from_raw((&hash_b as *const Hash).cast()) }; // this is comically stupid
 
-            let leaf_l = Rc::new(RefCell::new(Leaf::new(inner_l, hash_l, Rc::clone(&null))));
-            let leaf_r = Rc::new(RefCell::new(Leaf::new(inner_r, hash_r, Rc::clone(&null))));
+            let leaf_l = Rc::new(RefCell::new(Leaf::new(
+                inner_l,
+                hash_l,
+                index_l,
+                Rc::clone(&null),
+            )));
+            let leaf_r = Rc::new(RefCell::new(Leaf::new(
+                inner_r,
+                hash_r,
+                index_r,
+                Rc::clone(&null),
+            )));
 
             let branch = Rc::new(RefCell::new(Branch::new(
                 inner_b,
@@ -201,25 +231,27 @@ impl<M: Merklable> MerkleTree<M> {
         }
 
         if arr.len() == 1 {
-            let inner_l = arr[0];
-            let inner_b = inner_l.to_branch();
-            let hash_l = blake3::hash(&bincode::serialize(&inner_l).unwrap());
+            let index = arr[0].1;
 
-            let hash_b = {
-                let mut hasher = Hasher::new();
-                hasher.update(&bincode::serialize(&inner_b).unwrap());
-                hasher.update(hash_l.as_bytes());
-                hasher.finalize()
-            };
+            let inner_l = arr[0].0;
+            let inner_b = inner_l.to_branch();
+            let hash = blake3::hash(&bincode::serialize(&inner_l).unwrap());
+
+            // let hash_b = {
+            //     let mut hasher = Hasher::new();
+            //     hasher.update(&bincode::serialize(&inner_b).unwrap());
+            //     hasher.update(hash_l.as_bytes());
+            //     hasher.finalize()
+            // };
 
             // Safety: we set the correct parent right after
-            let null = unsafe { Rc::from_raw((&hash_b as *const Hash).cast()) }; // this is comically stupid
+            let null = unsafe { Rc::from_raw((&hash as *const Hash).cast()) }; // this is comically stupid
 
-            let leaf = Rc::new(RefCell::new(Leaf::new(inner_l, hash_l, null)));
+            let leaf = Rc::new(RefCell::new(Leaf::new(inner_l, hash, index, null)));
 
             let branch = Rc::new(RefCell::new(Branch::new(
                 inner_b,
-                hash_b,
+                hash,
                 None,
                 Child::Leaf(Rc::clone(&leaf)),
                 None,
@@ -269,44 +301,132 @@ impl<M: Merklable> MerkleTree<M> {
     }
 
     pub fn generate_proof(&self, id: M::ID) -> Option<Proof<M>> {
-        let leaf = self.leaves.get(&id)?;
-        let blocks = vec![];
+        let leaf = self.leaves.get(&id)?.borrow();
+        let mut index = leaf.index;
+        let parent = leaf.parent.borrow();
 
-        // find all of the blocks we need to include
+        // if the first branch only has one child, we skip it
+        let mut curr = if parent.right_child.is_none() {
+            parent.parent.as_ref().map(|p| Rc::clone(&p))
+        } else {
+            Some(Rc::clone(&leaf.parent))
+        };
 
-        // very first one we cannot guarentee that there is a leaf next or not
+        let mut siblings = vec![];
 
-        let digest = self.root.as_ref().unwrap().borrow().hash;
+        while let Some(branch) = curr {
+            let branch = branch.borrow();
+
+            // need to actually push the other child hmmmm
+            let silbing_side = Side::from_int(index & 1).other_side();
+
+            let sibling = match silbing_side {
+                Side::Left => &branch.left_child,
+                Side::Right => branch.right_child.as_ref().unwrap(),
+            };
+
+            let data = sibling.inner();
+            let hash = sibling.hash();
+
+            siblings.push(Sibling {
+                data,
+                side: silbing_side,
+                hash,
+            });
+
+            // mutate for next iteration
+            curr = branch.parent.as_ref().map(|p| Rc::clone(&p));
+            index >>= 1;
+        }
 
         Some(Proof {
-            data: leaf.borrow().inner,
-            blocks,
-            digest,
+            data: leaf.inner,
+            siblings,
         })
     }
 }
 
-// verify proof
+pub struct Proof<M: Merklable> {
+    data: M,
+    siblings: Vec<Sibling<M>>,
+}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[derive(Clone, Copy, Deserialize, Serialize)]
+enum Side {
+    Left,
+    Right,
+}
 
-    #[cfg(feature = "rayon")]
-    #[test]
-    fn test() {
-        #[derive(Clone, Copy, Serialize)]
-        struct Sum {
-            amount: u32,
+impl Side {
+    fn other_side(self) -> Self {
+        match self {
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
         }
+    }
 
-        impl Branchable for Sum {
-            fn fold(l: &Self, r: &Self) -> Self {
-                Self {
-                    amount: l.amount + r.amount,
+    // use from primitive later?
+    fn from_int(i: usize) -> Self {
+        match i {
+            0 => Side::Left,
+            _ => Side::Right,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Sibling<M: Merklable> {
+    data: M::Branch,
+    side: Side,
+    #[serde(with = "HashDef")]
+    hash: Hash,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Hash")]
+struct HashDef {
+    #[serde(getter = "Hash::as_bytes")]
+    bytes: [u8; 32],
+}
+
+impl From<HashDef> for Hash {
+    fn from(hash: HashDef) -> Hash {
+        Hash::from_hex(hash.bytes).unwrap()
+    }
+}
+
+pub fn verify_proof<M: Merklable>(proof: &Proof<M>, digest: Hash) -> Result<(), ()> {
+    // TODO: make more interactive errors
+
+    let mut curr_hash = blake3::hash(&bincode::serialize(&proof.data).unwrap());
+    let mut curr_data = proof.data.to_branch();
+
+    for sibling in proof.siblings.iter() {
+        curr_data = M::Branch::fold(&curr_data, &sibling.data);
+        curr_hash = {
+            let mut hasher = Hasher::new();
+            hasher.update(&bincode::serialize(&curr_data).unwrap());
+            match sibling.side {
+                Side::Left => {
+                    hasher.update(sibling.hash.as_bytes());
+                    hasher.update(curr_hash.as_bytes());
+                }
+                Side::Right => {
+                    hasher.update(curr_hash.as_bytes());
+                    hasher.update(sibling.hash.as_bytes());
                 }
             }
+            hasher.finalize()
         }
+    }
+
+    if curr_hash == digest {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
 
         #[derive(Clone, Copy, Serialize)]
         struct Stake {
