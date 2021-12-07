@@ -1,0 +1,2 @@
+a concurrent, generic implementation of a merkle tree for proofs
+                in Rust
