@@ -427,42 +427,61 @@ pub fn verify_proof<M: Merklable>(proof: &Proof<M>, digest: Hash) -> Result<(), 
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        #[derive(Clone, Copy, Serialize)]
-        struct Stake {
-            id: &'static str,
-            amount: u32,
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    struct Sum(u32);
+
+    impl Branchable for Sum {
+        fn fold(l: &Self, r: &Self) -> Self {
+            Self(l.0 + r.0)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize)]
+    struct Stake {
+        id: u32,
+        amount: u32,
+    }
+
+    impl Merklable for Stake {
+        type Branch = Sum;
+        type ID = u32;
+
+        fn to_branch(&self) -> Self::Branch {
+            Sum(self.amount)
         }
 
-        impl Merklable for Stake {
-            type Branch = Sum;
-            type ID = &'static str;
-
-            fn to_branch(&self) -> Self::Branch {
-                Sum {
-                    amount: self.amount,
-                }
-            }
-
-            fn id(&self) -> Self::ID {
-                self.id
-            }
+        fn id(&self) -> Self::ID {
+            self.id
         }
+    }
 
-        let vals = vec![1; 2_554_432];
-        let stakes: Vec<_> = vals
-            .iter()
-            .map(|v| Stake {
-                id: "james",
-                amount: *v,
-            })
-            .collect();
-
+    #[test]
+    fn fold() {
+        let stakes: Vec<_> = (0..20_001).map(|i| Stake { id: i, amount: 1 }).collect();
         let mut tree = MerkleTree::new();
-        tree.update_rayon(&stakes);
+        tree.update(&stakes);
+        assert_eq!(tree.root(), Some(Sum(20_001)));
 
-        println!("{:?}", tree.digest());
+        let stakes: Vec<_> = (0..12_341).map(|i| Stake { id: i, amount: 1 }).collect();
+        let mut tree = MerkleTree::new();
+        tree.update(&stakes);
+        assert_eq!(tree.root(), Some(Sum(12_341)));
+    }
 
-        panic!();
+    #[test]
+    fn proof() {
+        let stakes: Vec<_> = (0..20_001).map(|i| Stake { id: i, amount: 1 }).collect();
+        let mut tree = MerkleTree::new();
+        tree.update(&stakes);
+
+        let proof = tree.generate_proof(45).unwrap();
+        assert!(verify_proof(&proof, tree.digest()).is_ok());
+
+        let proof = tree.generate_proof(100).unwrap();
+        assert!(verify_proof(&proof, tree.digest()).is_ok());
     }
 }
