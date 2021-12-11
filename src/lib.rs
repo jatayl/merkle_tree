@@ -13,11 +13,11 @@ use blake3::{Hash, Hasher};
 use crossbeam::channel::{self, Sender};
 use serde::{Deserialize, Serialize};
 
-pub trait Branchable: Clone + Copy + Serialize {
+pub trait Branchable: Clone + Serialize {
     fn fold(l: &Self, r: &Self) -> Self;
 }
 
-pub trait Merklable: Sync + Clone + Copy + Serialize {
+pub trait Merklable: Sync + Clone + Serialize {
     type Branch: Branchable;
     type ID: Eq + hash::Hash;
     fn to_branch(&self) -> Self::Branch;
@@ -86,7 +86,7 @@ enum Child<M: Merklable> {
 impl<M: Merklable> Child<M> {
     fn inner(&self) -> M::Branch {
         match self {
-            Child::Branch(b) => b.borrow().inner,
+            Child::Branch(b) => b.borrow().inner.clone(),
             Child::Leaf(l) => l.borrow().inner.to_branch(),
         }
     }
@@ -120,34 +120,24 @@ impl<M: Merklable> MerkleTree<M> {
     }
 
     pub fn root(&self) -> Option<M::Branch> {
-        self.root.as_ref().map(|root| root.borrow().inner)
+        self.root.as_ref().map(|root| root.borrow().inner.clone())
     }
 
     // will need to make multiple updates good
     // for now assume this will be called only once
     pub fn update(&mut self, arr: impl AsRef<[M]>) {
-        let arr = arr.as_ref();
-        let arr: Vec<_> = (0..arr.len()).map(|i| (arr[i], i)).collect();
-        let (leaves_s, leaves_r) = channel::bounded(arr.len());
-        let root = Self::generate_subtree::<join::SerialJoin>(&arr, leaves_s);
-        self.root = Some(unsafe { root.into_inner() });
-        self.leaves = leaves_r
-            .iter()
-            .map(|leaf| {
-                let leaf = unsafe { leaf.into_inner() };
-                let id = leaf.borrow().inner.id();
-                (id, leaf)
-            })
-            .collect();
-        assert_eq!(self.leaves.len(), arr.len());
+        self.update_helper::<join::SerialJoin>(arr.as_ref())
     }
 
     #[cfg(feature = "rayon")]
     pub fn update_rayon(&mut self, arr: impl AsRef<[M]>) {
-        let arr = arr.as_ref();
-        let arr: Vec<_> = (0..arr.len()).map(|i| (arr[i], i)).collect();
+        self.update_helper::<join::RayonJoin>(arr.as_ref())
+    }
+
+    fn update_helper<J: join::Join>(&mut self, arr: &[M]) {
+        let arr: Vec<_> = (0..arr.len()).map(|i| (arr[i].clone(), i)).collect();
         let (leaves_s, leaves_r) = channel::bounded(arr.len());
-        let root = Self::generate_subtree::<join::RayonJoin>(&arr, leaves_s);
+        let root = Self::generate_subtree::<J>(&arr, leaves_s);
         self.root = Some(unsafe { root.into_inner() });
         self.leaves = leaves_r
             .iter()
@@ -165,8 +155,8 @@ impl<M: Merklable> MerkleTree<M> {
         leaves_s: Sender<Ratn<Leaf<M>>>,
     ) -> Ratn<Branch<M>> {
         if arr.len() == 2 {
-            let (inner_l, index_l) = arr[0];
-            let (inner_r, index_r) = arr[1];
+            let (inner_l, index_l) = arr[0].clone();
+            let (inner_r, index_r) = arr[1].clone();
 
             let inner_b = M::Branch::fold(&inner_l.to_branch(), &inner_r.to_branch());
 
@@ -202,7 +192,7 @@ impl<M: Merklable> MerkleTree<M> {
         }
 
         if arr.len() == 1 {
-            let (inner_l, index) = arr[0];
+            let (inner_l, index) = arr[0].clone();
 
             let inner_b = inner_l.to_branch();
             let hash = blake3::hash(&bincode::serialize(&inner_l).unwrap());
@@ -290,7 +280,7 @@ impl<M: Merklable> MerkleTree<M> {
                 _ => &branch.left_child,
             };
 
-            let data = sibling.inner();
+            let data = sibling.inner().clone();
             let hash = sibling.hash();
 
             siblings.push(Sibling { data, hash });
@@ -301,7 +291,7 @@ impl<M: Merklable> MerkleTree<M> {
         }
 
         Some(Proof {
-            data: leaf.inner,
+            data: leaf.inner.clone(),
             index: leaf.index,
             path_to_root,
             siblings,
@@ -331,8 +321,8 @@ pub struct Proof<M: Merklable> {
 }
 
 impl<M: Merklable> Proof<M> {
-    pub fn data(&self) -> M {
-        self.data
+    pub fn data(&self) -> &M {
+        &self.data
     }
 
     pub fn index(&self) -> usize {
@@ -382,7 +372,7 @@ pub fn verify_proof<M: Merklable>(proof: &Proof<M>, digest: Hash) -> bool {
 mod tests {
     use super::*;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     struct Sum(u32);
 
     impl Branchable for Sum {
@@ -391,7 +381,7 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone, Copy, Serialize)]
+    #[derive(Debug, Clone, Serialize)]
     struct Stake {
         id: u32,
         amount: u32,
