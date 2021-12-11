@@ -10,7 +10,7 @@ use std::hash;
 use std::rc::Rc;
 
 use blake3::{Hash, Hasher};
-use crossbeam::channel::{self, Sender};
+use flume::{self, Sender};
 use serde::{Deserialize, Serialize};
 
 pub trait Branchable: Clone + Serialize {
@@ -136,7 +136,7 @@ impl<M: Merklable> MerkleTree<M> {
 
     fn update_helper<J: join::Join>(&mut self, arr: &[M]) {
         let arr: Vec<_> = (0..arr.len()).map(|i| (arr[i].clone(), i)).collect();
-        let (leaves_s, leaves_r) = channel::bounded(arr.len());
+        let (leaves_s, leaves_r) = flume::bounded(arr.len());
         let root = Self::generate_subtree::<J>(&arr, leaves_s);
         self.root = Some(unsafe { root.into_inner() });
         self.leaves = leaves_r
