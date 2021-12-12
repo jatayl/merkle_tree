@@ -10,7 +10,7 @@ use std::hash;
 use std::rc::Rc;
 
 use blake3::{Hash, Hasher};
-use flume::{self, Sender};
+use flume::Sender;
 use serde::{Deserialize, Serialize};
 
 pub trait Branchable: Clone + Serialize {
@@ -34,12 +34,24 @@ struct Branch<M: Merklable> {
 
 impl<M: Merklable> Branch<M> {
     fn new(
-        inner: M::Branch,
-        hash: Hash,
         parent: Option<Rc<RefCell<Branch<M>>>>,
         left_child: Child<M>,
         right_child: Option<Child<M>>,
     ) -> Self {
+        let (inner, hash) = if let Some(ref right_child) = right_child {
+            let inner_b = M::Branch::fold(&left_child.inner(), &right_child.inner());
+            let hash_b = {
+                let mut hasher = Hasher::new();
+                hasher.update(&bincode::serialize(&inner_b).unwrap());
+                hasher.update(left_child.hash().as_bytes());
+                hasher.update(right_child.hash().as_bytes());
+                hasher.finalize()
+            };
+            (inner_b, hash_b)
+        } else {
+            (left_child.inner(), left_child.hash())
+        };
+
         Branch {
             inner,
             hash,
@@ -64,7 +76,8 @@ struct Leaf<M: Merklable> {
 }
 
 impl<M: Merklable> Leaf<M> {
-    fn new(inner: M, hash: Hash, index: usize, parent: Option<Rc<RefCell<Branch<M>>>>) -> Self {
+    fn new(inner: M, index: usize, parent: Option<Rc<RefCell<Branch<M>>>>) -> Self {
+        let hash = blake3::hash(&bincode::serialize(&inner).unwrap());
         Leaf {
             inner,
             hash,
@@ -123,8 +136,6 @@ impl<M: Merklable> MerkleTree<M> {
         self.root.as_ref().map(|root| root.borrow().inner.clone())
     }
 
-    // will need to make multiple updates good
-    // for now assume this will be called only once
     pub fn update(&mut self, arr: impl AsRef<[M]>) {
         self.update_helper::<join::SerialJoin>(arr.as_ref())
     }
@@ -137,17 +148,53 @@ impl<M: Merklable> MerkleTree<M> {
     fn update_helper<J: join::Join>(&mut self, arr: &[M]) {
         let arr: Vec<_> = (0..arr.len()).map(|i| (arr[i].clone(), i)).collect();
         let (leaves_s, leaves_r) = flume::bounded(arr.len());
-        let root = Self::generate_subtree::<J>(&arr, leaves_s);
-        self.root = Some(unsafe { root.into_inner() });
-        self.leaves = leaves_r
-            .iter()
-            .map(|leaf| {
-                let leaf = unsafe { leaf.into_inner() };
-                let id = leaf.borrow().inner.id();
-                (id, leaf)
-            })
-            .collect();
-        assert_eq!(self.leaves.len(), arr.len());
+
+        let expected_size = if self.root.is_none() {
+            let root = Self::generate_subtree::<J>(&arr, leaves_s);
+            self.root = Some(unsafe { root.into_inner() });
+            arr.len()
+        } else {
+            let mut curr_size = self.leaves.len(); // size we are accumulating
+            let mut index = 0; // indexing into arr
+            while index < arr.len() {
+                if util::partition(curr_size) << 1 == curr_size {
+                    // then this is a full tree
+                    // make an equal sized sibling tree
+                    let ext_size = if (arr.len() - index) >= curr_size {
+                        curr_size
+                    } else {
+                        arr.len() - index
+                    };
+
+                    let leaves_s_clone = leaves_s.clone();
+                    let other_root =
+                        Self::generate_subtree::<J>(&arr[index..ext_size], leaves_s_clone);
+                    let other_root = unsafe { other_root.into_inner() };
+
+                    let new_root = Rc::new(RefCell::new(Branch::new(
+                        None,
+                        Child::Branch(Rc::clone(self.root.as_ref().unwrap())),
+                        Some(Child::Branch(other_root)),
+                    )));
+                    self.root = Some(new_root);
+
+                    index += ext_size;
+                    curr_size += ext_size;
+                } else {
+                    // this is not a full tree
+                    todo!()
+                }
+            }
+            curr_size
+        };
+
+        self.leaves.extend(leaves_r.try_iter().map(|leaf| {
+            let leaf = unsafe { leaf.into_inner() };
+            let id = leaf.borrow().inner.id();
+            (id, leaf)
+        }));
+
+        assert_eq!(self.leaves.len(), expected_size);
     }
 
     fn generate_subtree<J: join::Join>(
@@ -158,25 +205,10 @@ impl<M: Merklable> MerkleTree<M> {
             let (inner_l, index_l) = arr[0].clone();
             let (inner_r, index_r) = arr[1].clone();
 
-            let inner_b = M::Branch::fold(&inner_l.to_branch(), &inner_r.to_branch());
-
-            let hash_l = blake3::hash(&bincode::serialize(&inner_l).unwrap());
-            let hash_r = blake3::hash(&bincode::serialize(&inner_r).unwrap());
-
-            let hash_b = {
-                let mut hasher = Hasher::new();
-                hasher.update(&bincode::serialize(&inner_b).unwrap());
-                hasher.update(hash_l.as_bytes());
-                hasher.update(hash_r.as_bytes());
-                hasher.finalize()
-            };
-
-            let leaf_l = Rc::new(RefCell::new(Leaf::new(inner_l, hash_l, index_l, None)));
-            let leaf_r = Rc::new(RefCell::new(Leaf::new(inner_r, hash_r, index_r, None)));
+            let leaf_l = Rc::new(RefCell::new(Leaf::new(inner_l, index_l, None)));
+            let leaf_r = Rc::new(RefCell::new(Leaf::new(inner_r, index_r, None)));
 
             let branch = Rc::new(RefCell::new(Branch::new(
-                inner_b,
-                hash_b,
                 None,
                 Child::Leaf(Rc::clone(&leaf_l)),
                 Some(Child::Leaf(Rc::clone(&leaf_r))),
@@ -194,14 +226,9 @@ impl<M: Merklable> MerkleTree<M> {
         if arr.len() == 1 {
             let (inner_l, index) = arr[0].clone();
 
-            let inner_b = inner_l.to_branch();
-            let hash = blake3::hash(&bincode::serialize(&inner_l).unwrap());
-
-            let leaf = Rc::new(RefCell::new(Leaf::new(inner_l, hash, index, None)));
+            let leaf = Rc::new(RefCell::new(Leaf::new(inner_l, index, None)));
 
             let branch = Rc::new(RefCell::new(Branch::new(
-                inner_b,
-                hash,
                 None,
                 Child::Leaf(Rc::clone(&leaf)),
                 None,
@@ -224,19 +251,7 @@ impl<M: Merklable> MerkleTree<M> {
 
         let (left, right) = unsafe { (left.into_inner(), right.into_inner()) };
 
-        let inner = M::Branch::fold(&left.borrow().inner, &right.borrow().inner);
-
-        let hash = {
-            let mut hasher = Hasher::new();
-            hasher.update(&bincode::serialize(&inner).unwrap());
-            hasher.update(left.borrow().hash.as_bytes());
-            hasher.update(right.borrow().hash.as_bytes());
-            hasher.finalize()
-        };
-
         let branch = Rc::new(RefCell::new(Branch::new(
-            inner,
-            hash,
             None,
             Child::Branch(Rc::clone(&left)),
             Some(Child::Branch(Rc::clone(&right))),
@@ -423,6 +438,21 @@ mod tests {
             let proof = tree.generate_proof(i).unwrap();
             assert!(verify_proof(&proof, tree.digest()), "{}", i);
         }
+    }
+
+    #[test]
+    fn incremental_update() {
+        let stakes: Vec<_> = (0..4096).map(|i| Stake { id: i, amount: 1 }).collect();
+        let mut tree_cons = MerkleTree::new();
+        tree_cons.update(&stakes);
+        let stakes: Vec<_> = (4096..5096).map(|i| Stake { id: i, amount: 1 }).collect();
+        tree_cons.update(&stakes);
+
+        let mut tree_once = MerkleTree::new();
+        let stakes: Vec<_> = (0..5096).map(|i| Stake { id: i, amount: 1 }).collect();
+        tree_once.update(&stakes);
+
+        assert_eq!(tree_cons.digest(), tree_cons.digest());
     }
 
     #[cfg(feature = "rayon")]
